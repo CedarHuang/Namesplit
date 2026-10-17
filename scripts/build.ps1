@@ -1,0 +1,66 @@
+#!/usr/bin/env pwsh
+<#
+.SYNOPSIS
+    构建 Namesplit 的两个产物：Go 核心进程与 Tauri 应用。
+.DESCRIPTION
+    版本由 git describe 推导（发布版本 = tag）。产物输出到 build/。
+    用法: pwsh ./scripts/build.ps1
+#>
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+
+$root = Split-Path -Parent $PSScriptRoot
+Push-Location $root
+try {
+    $desc = (& git describe --tags --always --dirty 2>$null)
+    if ($LASTEXITCODE -ne 0 -or -not $desc) {
+        throw '无法从 git 读取版本：需要 git 仓库且至少有一次提交'
+    }
+    $desc = $desc.Trim()
+    if ($desc -match '^v\d') {
+        $version = $desc.Substring(1)
+    }
+    elseif ($desc -match '^\d+\.\d+\.\d+') {
+        $version = $desc
+    }
+    else {
+        $version = "0.0.0-dev+$desc"
+    }
+    $commit = (& git rev-parse --short HEAD).Trim()
+
+    $outDir = Join-Path $root 'build'
+    New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+    Write-Host "==> 版本 $version（$commit）"
+
+    # 1. Go 核心进程
+    $ldflags = "-s -w -X github.com/CedarHuang/Namesplit/internal/version.Version=$version -X github.com/CedarHuang/Namesplit/internal/version.Commit=$commit"
+    & go build -trimpath -ldflags $ldflags -o (Join-Path $outDir 'namesplit-core.exe') ./cmd/namesplit-core
+    if ($LASTEXITCODE -ne 0) { throw 'Go 核心进程构建失败' }
+
+    # 直接调用 Tauri CLI：npm run 会吞掉部分命令行参数
+    $tauriCli = Join-Path $root 'node_modules/@tauri-apps/cli/tauri.js'
+    if (-not (Test-Path $tauriCli)) { throw '未找到 Tauri CLI，请先执行 npm install' }
+
+    # 2. 图标：以 src-tauri/icons/app-icon.svg 为唯一源，生成各尺寸 ico/png（生成物不入库）
+    & (Join-Path $PSScriptRoot 'gen-icons.ps1')
+
+    # 3. Tauri 应用：版本以内联 JSON 合并注入，不修改纳入版本库的 tauri.conf.json
+    $versionOverride = @{ version = $version } | ConvertTo-Json -Compress
+    & node $tauriCli build -c $versionOverride
+    if ($LASTEXITCODE -ne 0) { throw 'Tauri 应用构建失败' }
+
+    $exe = Join-Path $root 'src-tauri/target/release/namesplit.exe'
+    if (-not (Test-Path $exe)) { throw "未找到 Tauri 应用产物: $exe" }
+    Copy-Item $exe (Join-Path $outDir 'Namesplit.exe') -Force
+
+    Write-Host '==> 构建完成:'
+    Get-ChildItem $outDir | ForEach-Object {
+        Write-Host ("    {0}  {1:N1} MB" -f $_.Name, ($_.Length / 1MB))
+    }
+}
+finally {
+    Pop-Location
+}

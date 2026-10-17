@@ -31,3 +31,20 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Node dependencies
+node_modules/
+
+# Frontend build output
+dist/
+
+# Rust / Tauri build output
+src-tauri/target/
+src-tauri/gen/
+
+# Generated icons (source: src-tauri/icons/app-icon.svg)
+src-tauri/icons/*
+!src-tauri/icons/app-icon.svg
+
+# Build script output
+build/

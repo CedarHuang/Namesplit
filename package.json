@@ -1,0 +1,27 @@
+{
+  "name": "namesplit",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "pretauri": "pwsh ./scripts/gen-icons.ps1",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/node": "^22",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "typescript": "^5.9",
+    "vite": "^8.3.4"
+  },
+  "dependencies": {
+    "antd": "^6.6.6",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  }
+}
