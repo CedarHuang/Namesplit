@@ -1,21 +1,18 @@
 // Namesplit 应用侧：窗口/托盘/单实例/sidecar 监护。
 mod job;
-mod runtime;
+pub mod relay;
+pub mod runtime;
 mod sidecar;
+pub mod sidecar_client;
 
 use std::sync::Arc;
 
 use serde_json::json;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
-use runtime::{ConnInfo, Runtime};
-
-#[tauri::command]
-fn get_connection(rt: State<'_, Arc<Runtime>>) -> ConnInfo {
-    rt.conn_info()
-}
+use runtime::Runtime;
 
 fn show_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -78,7 +75,6 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main(app);
         }))
-        .invoke_handler(tauri::generate_handler![get_connection])
         .setup(|app| {
             let rt = Arc::new(Runtime::new()?);
             rt.log(&format!(

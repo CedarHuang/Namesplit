@@ -33,6 +33,14 @@ try {
     $outDir = Join-Path $root 'build'
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
+    # 构建元数据供打包/发布脚本读取；避免 version 逻辑在多处重复。
+    $meta = @{
+        version  = $version
+        commit   = $commit
+        built_at = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    $meta | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $outDir 'version.json') -Encoding utf8
+
     Write-Host "==> 版本 $version（$commit）"
 
     # 1. Go 核心进程

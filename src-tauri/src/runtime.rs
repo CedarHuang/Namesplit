@@ -6,8 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
-
 pub const MAX_RESTARTS_PER_WINDOW: usize = 3;
 pub const RESTART_WINDOW_SECS: u64 = 600;
 pub const BACKOFF_BASE_MS: u64 = 250;
@@ -24,18 +22,9 @@ pub struct Runtime {
     /// 滑动窗口内的重启时刻（10 分钟）。
     pub restart_times: Mutex<Vec<Instant>>,
     pub launch_count: AtomicU64,
+    /// sidecar stderr 上报的启动配置错误；由监护线程在进程退出后消费。
+    config_error: Mutex<Option<serde_json::Value>>,
     log_file: Mutex<File>,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConnInfo {
-    pub port: Option<u16>,
-    pub token: String,
-    pub sidecar_pid: u32,
-    pub restart_count: usize,
-    pub failed: bool,
-    pub log_path: String,
 }
 
 impl Runtime {
@@ -56,6 +45,7 @@ impl Runtime {
             sidecar_pid: AtomicU32::new(0),
             restart_times: Mutex::new(Vec::new()),
             launch_count: AtomicU64::new(1),
+            config_error: Mutex::new(None),
             log_file: Mutex::new(log_file),
         })
     }
@@ -93,15 +83,14 @@ impl Runtime {
         self.restart_times.lock().unwrap().len()
     }
 
-    pub fn conn_info(&self) -> ConnInfo {
-        ConnInfo {
-            port: *self.port.lock().unwrap(),
-            token: self.token.clone(),
-            sidecar_pid: self.sidecar_pid.load(Ordering::SeqCst),
-            restart_count: self.restart_count(),
-            failed: self.failed.load(Ordering::SeqCst),
-            log_path: self.log_path.display().to_string(),
-        }
+    /// 记录 sidecar stderr 上报的启动配置错误。
+    pub fn set_config_error(&self, value: serde_json::Value) {
+        *self.config_error.lock().unwrap() = Some(value);
+    }
+
+    /// 取出并清空启动配置错误；进程退出后只消费一次。
+    pub fn take_config_error(&self) -> Option<serde_json::Value> {
+        self.config_error.lock().unwrap().take()
     }
 }
 

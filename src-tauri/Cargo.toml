@@ -5,6 +5,7 @@ description = "Namesplit — Windows DNS 分流客户端"
 authors = ["CedarHuang"]
 edition = "2021"
 rust-version = "1.90"
+default-run = "namesplit"
 
 [lib]
 name = "namesplit_lib"

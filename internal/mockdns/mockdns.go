@@ -33,14 +33,20 @@ import (
 
 // PlainConfig 是明文 UDP 上游的应答配置。
 type PlainConfig struct {
-	// A 是 A 查询的应答地址；nil 表示返回 NODATA。
+	// A 是 A 查询的主应答地址；nil 表示无 A 记录。
 	A net.IP
+	// AdditionalA 是追加的 A 应答地址，用于多地址（多值 RRset）场景。
+	AdditionalA []net.IP
 	// AAAA 是 AAAA 查询的应答地址；nil 表示返回 NODATA。
 	AAAA net.IP
 	// TTL 是应答 TTL（秒）；0 使用 60。
 	TTL uint32
 	// Rcode 是强制应答 RCODE；0 表示 NOERROR。
 	Rcode int
+	// Delay 是写出应答前的延迟，用于模拟超时上游。
+	Delay time.Duration
+	// Truncate 置位 TC 标志并丢弃应答内容，用于模拟截断响应。
+	Truncate bool
 }
 
 // Plain 是明文 UDP 上游。
@@ -118,9 +124,20 @@ func (p *Plain) handle(w dns.ResponseWriter, req *dns.Msg) {
 	p.seen = append(p.seen, req.Copy())
 	p.mu.Unlock()
 
+	if p.cfg.Delay > 0 {
+		time.Sleep(p.cfg.Delay)
+	}
+
 	resp := new(dns.Msg)
 	resp.SetReply(req)
 	resp.Authoritative = true
+
+	if p.cfg.Truncate {
+		resp.Truncated = true
+		_ = w.WriteMsg(resp)
+
+		return
+	}
 
 	if p.cfg.Rcode != 0 {
 		resp.Rcode = p.cfg.Rcode
@@ -133,7 +150,10 @@ func (p *Plain) handle(w dns.ResponseWriter, req *dns.Msg) {
 		q := req.Question[0]
 		switch q.Qtype {
 		case dns.TypeA:
-			if p.cfg.A != nil {
+			for _, ip := range append([]net.IP{p.cfg.A}, p.cfg.AdditionalA...) {
+				if ip == nil {
+					continue
+				}
 				resp.Answer = append(resp.Answer, &dns.A{
 					Hdr: dns.RR_Header{
 						Name:   q.Name,
@@ -141,7 +161,7 @@ func (p *Plain) handle(w dns.ResponseWriter, req *dns.Msg) {
 						Class:  dns.ClassINET,
 						Ttl:    p.cfg.TTL,
 					},
-					A: p.cfg.A,
+					A: ip,
 				})
 			}
 		case dns.TypeAAAA:

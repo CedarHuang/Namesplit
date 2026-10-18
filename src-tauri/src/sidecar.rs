@@ -2,19 +2,24 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tauri::{AppHandle, Emitter};
 
 use crate::job;
+use crate::relay::{self, RelayStats, TauriBatchSink};
 use crate::runtime::{
     Runtime, BACKOFF_BASE_MS, BACKOFF_MAX_MS, MAX_RESTARTS_PER_WINDOW, RESTART_WINDOW_SECS,
 };
 
 const READY_PREFIX: &str = "NAMESPLIT_READY ";
+/// sidecar 启动失败时向 stderr 打印的配置错误行；解析后随 failed 状态上报。
+const CONFIG_ERROR_PREFIX: &str = "NAMESPLIT_CONFIG_ERROR ";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// sidecar 可执行文件位置：优先使用 tauri-build 从 externalBin 复制到当前 exe 同目录的副本，
@@ -44,11 +49,15 @@ pub fn supervise(app: AppHandle, rt: Arc<Runtime>) {
             rt.log("应用正在退出，监护线程结束");
             return;
         }
-        let mut child = match spawn_once(&rt) {
-            Ok(child) => child,
+        let mut relay_stop: Option<Arc<AtomicBool>> = None;
+        let mut relay_stats: Option<Arc<RelayStats>> = None;
+
+        let (mut child, stderr_thread) = match spawn_once(&rt) {
+            Ok(pair) => pair,
             Err(err) => {
-                mark_failed(&rt, &format!("拉起 sidecar 失败: {err}"));
-                emit_state(&app, &rt, "failed");
+                let reason = format!("拉起 sidecar 失败: {err}");
+                mark_failed(&rt, &reason);
+                emit_state(&app, &rt, "failed", Some(&reason), None);
                 return;
             }
         };
@@ -63,23 +72,81 @@ pub fn supervise(app: AppHandle, rt: Arc<Runtime>) {
                     spawn_at.elapsed().as_millis(),
                     rt.launch_count.load(std::sync::atomic::Ordering::SeqCst)
                 ));
-                emit_state(&app, &rt, "running");
+                emit_state(&app, &rt, "running", None, None);
+
+                // READY 之后才建立事件流；端口与 token 只在本进程内使用，不进入 Tauri 事件。
+                let stop = Arc::new(AtomicBool::new(false));
+                let stats = Arc::new(RelayStats::default());
+                let sink = Arc::new(TauriBatchSink::new(app.clone()));
+                let _handle = relay::spawn(
+                    relay::RelayConfig::new(*port, rt.token.clone()),
+                    sink,
+                    stop.clone(),
+                    stats.clone(),
+                );
+                relay_stop = Some(stop);
+                relay_stats = Some(stats);
             }
             None => {
                 rt.log("sidecar 在就绪前退出或就绪超时");
-                let _ = child.kill();
-                let _ = child.wait();
+                // 尚未退出才终止；退出状态统一由外层 child.wait() 收口，避免重复 reap。
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = child.kill();
+                }
             }
         }
 
         let status = child.wait();
+        // 等 stderr 读完，确保 NAMESPLIT_CONFIG_ERROR 行已解析后再判断退出原因。
+        if let Some(handle) = stderr_thread {
+            let _ = handle.join();
+        }
         rt.clear_ready();
+        if let Some(stop) = relay_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(stats) = relay_stats.take() {
+            let snapshot = stats.snapshot();
+            // 连接失败/401 时 events 为 0，仍需把 last_error 落盘。
+            if snapshot.events > 0 || snapshot.dropped_events > 0 || snapshot.last_error.is_some() {
+                rt.log(&format!(
+                    "事件中继：连接 {} 次、批次 {}、事件 {}、丢弃批次 {}（{} 事件）{}",
+                    snapshot.connects,
+                    snapshot.batches,
+                    snapshot.events,
+                    snapshot.dropped_batches,
+                    snapshot.dropped_events,
+                    snapshot
+                        .last_error
+                        .map(|err| format!("，最后错误：{err}"))
+                        .unwrap_or_default()
+                ));
+            }
+        }
         if rt.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             rt.log(&format!("应用退出中，sidecar 已结束：{status:?}"));
             return;
         }
-        rt.log(&format!("sidecar 意外退出：{status:?}"));
-        emit_state(&app, &rt, "exited");
+
+        let exit_reason = format!("sidecar 意外退出：{status:?}");
+        rt.log(&exit_reason);
+
+        // 启动配置错误（退出码 3）：不自动重启，进入 failed 并随事件上报 config_error。
+        let config_error = rt.take_config_error();
+        if status.as_ref().ok().and_then(|status| status.code()) == Some(3)
+            || config_error.is_some()
+        {
+            let reason = config_error
+                .as_ref()
+                .and_then(|value| value.get("message").and_then(|message| message.as_str()))
+                .unwrap_or("sidecar 启动配置错误（退出码 3）")
+                .to_string();
+            mark_failed(&rt, &reason);
+            emit_state(&app, &rt, "failed", Some(&reason), config_error.as_ref());
+            return;
+        }
+
+        emit_state(&app, &rt, "exited", Some(&exit_reason), None);
 
         let now = Instant::now();
         let attempt = {
@@ -94,13 +161,11 @@ pub fn supervise(app: AppHandle, rt: Arc<Runtime>) {
         };
         match attempt {
             None => {
-                mark_failed(
-                    &rt,
-                    &format!(
-                        "10 分钟内已重启 {MAX_RESTARTS_PER_WINDOW} 次，达到上限；进入失败态，不再自动重启（需人工处理）"
-                    ),
+                let reason = format!(
+                    "10 分钟内已重启 {MAX_RESTARTS_PER_WINDOW} 次，达到上限；进入失败态，不再自动重启（需人工处理）"
                 );
-                emit_state(&app, &rt, "failed");
+                mark_failed(&rt, &reason);
+                emit_state(&app, &rt, "failed", Some(&reason), None);
                 return;
             }
             Some(n) => {
@@ -110,14 +175,14 @@ pub fn supervise(app: AppHandle, rt: Arc<Runtime>) {
                 rt.log(&format!(
                     "第 {n} 次退避重启：{backoff_ms}ms 后重新拉起 sidecar（10 分钟窗口上限 {MAX_RESTARTS_PER_WINDOW} 次）"
                 ));
-                emit_state(&app, &rt, "restarting");
+                emit_state(&app, &rt, "restarting", Some(&exit_reason), None);
                 std::thread::sleep(Duration::from_millis(backoff_ms));
             }
         }
     }
 }
 
-fn spawn_once(rt: &Arc<Runtime>) -> std::io::Result<Child> {
+fn spawn_once(rt: &Arc<Runtime>) -> std::io::Result<(Child, Option<JoinHandle<()>>)> {
     let path = sidecar_path();
     rt.log(&format!("拉起 sidecar：{}", path.display()));
     let mut cmd = Command::new(&path);
@@ -140,15 +205,21 @@ fn spawn_once(rt: &Arc<Runtime>) -> std::io::Result<Child> {
         }
         Err(err) => rt.log(&format!("警告：创建 Job Object 失败：{err}")),
     }
-    if let Some(stderr) = child.stderr.take() {
+    let stderr_thread = child.stderr.take().map(|stderr| {
         let rt = rt.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Some(rest) = line.strip_prefix(CONFIG_ERROR_PREFIX) {
+                    match serde_json::from_str::<serde_json::Value>(rest) {
+                        Ok(value) => rt.set_config_error(value),
+                        Err(err) => rt.log(&format!("[sidecar] 配置错误行不是合法 JSON：{err}")),
+                    }
+                }
                 rt.log(&format!("[sidecar] {line}"));
             }
-        });
-    }
-    Ok(child)
+        })
+    });
+    Ok((child, stderr_thread))
 }
 
 /// 读取 stdout 直到 NAMESPLIT_READY 行；同时监视子进程是否提前退出。
@@ -187,14 +258,25 @@ fn wait_ready(rt: &Arc<Runtime>, child: &mut Child, timeout: Duration) -> Option
     }
 }
 
-fn emit_state(app: &AppHandle, rt: &Runtime, status: &str) {
-    let payload = json!({
-        "status": status,
+fn emit_state(
+    app: &AppHandle,
+    rt: &Runtime,
+    state: &str,
+    reason: Option<&str>,
+    config_error: Option<&serde_json::Value>,
+) {
+    // 只上报生命周期状态；端口与 token 留在 Rust 侧，不进入渲染器可见事件。
+    let mut payload = json!({
+        "state": state,
         "pid": rt.sidecar_pid.load(std::sync::atomic::Ordering::SeqCst),
-        "port": *rt.port.lock().unwrap(),
-        "restarts": rt.restart_count(),
-        "failed": rt.failed.load(std::sync::atomic::Ordering::SeqCst),
+        "restart_count": rt.restart_count(),
     });
+    if let Some(reason) = reason {
+        payload["reason"] = json!(reason);
+    }
+    if let Some(config_error) = config_error {
+        payload["config_error"] = config_error.clone();
+    }
     let _ = app.emit("sidecar://state", payload);
 }
 
