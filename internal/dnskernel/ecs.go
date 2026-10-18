@@ -34,3 +34,24 @@ func stripECS(req *dns.Msg) (stripped *dns.Msg) {
 
 	return stripped
 }
+
+// stripOPT 移除应答附加段中的 OPT 伪 RR。
+//
+// 响应不携带 OPT，也不回显 DO；上游应答与库缓存仍可能残留 OPT，且事件的
+// additional 会把 OPT 渲染成多行伪段落，因此在内核出口统一剥离，不依赖
+// 上游行为。
+func stripOPT(msg *dns.Msg) {
+	if msg == nil || len(msg.Extra) == 0 {
+		return
+	}
+
+	filtered := make([]dns.RR, 0, len(msg.Extra))
+	for _, rr := range msg.Extra {
+		if rr.Header().Rrtype == dns.TypeOPT {
+			continue
+		}
+
+		filtered = append(filtered, rr)
+	}
+	msg.Extra = filtered
+}

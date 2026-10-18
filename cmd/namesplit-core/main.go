@@ -2,10 +2,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/CedarHuang/Namesplit/internal/app"
 	"github.com/CedarHuang/Namesplit/internal/version"
 )
 
@@ -15,8 +19,13 @@ func main() {
 
 	if *showVersion {
 		fmt.Println(version.String())
+
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "namesplit-core %s: DNS 解析尚未实现\n", version.String())
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	code := app.Run(ctx, app.Options{Token: os.Getenv("NAMESPLIT_TOKEN")})
+	os.Exit(code)
 }

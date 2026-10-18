@@ -3,709 +3,735 @@ package dnskernel
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/miekg/dns"
 
+	"github.com/CedarHuang/Namesplit/internal/event"
+	"github.com/CedarHuang/Namesplit/internal/localrecords"
 	"github.com/CedarHuang/Namesplit/internal/mockdns"
+	"github.com/CedarHuang/Namesplit/internal/rules"
+	"github.com/CedarHuang/Namesplit/internal/upstream"
 )
 
-// discardLogger 返回不输出内容的 logger，避免测试噪音。
 func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	return slog.New(slog.DiscardHandler)
 }
 
-// testGroup 构造上游组并在测试结束时关闭。
-func testGroup(t *testing.T, cfg GroupConfig) *Group {
-	t.Helper()
-
-	if cfg.Timeout == 0 {
-		cfg.Timeout = time.Second
-	}
-	if cfg.Mode == "" {
-		cfg.Mode = proxy.UpstreamModeLoadBalance
-	}
-
-	g, err := NewGroup(cfg, discardLogger())
-	if err != nil {
-		t.Fatalf("构造上游组 %q: %v", cfg.Name, err)
-	}
-	t.Cleanup(func() { _ = g.Close() })
-
-	return g
+// capturedRecord 是一条被捕获的日志记录。
+type capturedRecord struct {
+	message string
+	attrs   map[string]string
 }
 
-// startTestKernel 启动内核并返回监听地址与事件通道。
-func startTestKernel(t *testing.T, router *Router, groups map[string]*Group, local LocalLookup) (addr string, events <-chan Event) {
-	t.Helper()
+// captureHandler 是并发安全的 slog.Handler，用于断言内核日志。
+type captureHandler struct {
+	mu      sync.Mutex
+	records []capturedRecord
+}
 
-	ch := make(chan Event, 32)
-	srv, err := NewServer(Config{
-		Router:     router,
-		Groups:     groups,
-		Local:      local,
-		Logger:     discardLogger(),
-		ListenAddr: "127.0.0.1:0",
-		OnEvent:    func(e Event) { ch <- e },
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *captureHandler) Handle(_ context.Context, record slog.Record) error {
+	attrs := make(map[string]string)
+	record.Attrs(func(attr slog.Attr) bool {
+		attrs[attr.Key] = attr.Value.String()
+
+		return true
 	})
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.records = append(h.records, capturedRecord{message: record.Message, attrs: attrs})
+
+	return nil
+}
+
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h *captureHandler) WithGroup(string) slog.Handler { return h }
+
+// snapshot 返回当前已捕获记录的副本。
+func (h *captureHandler) snapshot() (records []capturedRecord) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return append(records, h.records...)
+}
+
+// findByMessage 返回消息匹配的首条记录。
+func findByMessage(records []capturedRecord, message string) (capturedRecord, bool) {
+	for _, record := range records {
+		if record.message == message {
+			return record, true
+		}
+	}
+
+	return capturedRecord{}, false
+}
+
+type fakeView struct {
+	rules        *rules.Table
+	local        *localrecords.Table
+	groups       *upstream.Manager
+	defaultGroup string
+}
+
+func (v *fakeView) Rules() *rules.Table        { return v.rules }
+func (v *fakeView) Local() *localrecords.Table { return v.local }
+func (v *fakeView) Groups() *upstream.Manager  { return v.groups }
+func (v *fakeView) DefaultGroup() string       { return v.defaultGroup }
+
+type fakeStore struct {
+	view *fakeView
+}
+
+func (s *fakeStore) Acquire() (View, func()) { return s.view, func() {} }
+
+func compileRules(t *testing.T, input []rules.Rule) *rules.Table {
+	t.Helper()
+
+	table, diags := rules.Compile(input)
+	if len(diags) > 0 {
+		t.Fatalf("编译规则: %+v", diags)
+	}
+
+	return table
+}
+
+func compileLocal(t *testing.T, input []localrecords.Record, ptrAuto bool) *localrecords.Table {
+	t.Helper()
+
+	table, diags := localrecords.Compile(input, ptrAuto)
+	if diags != nil {
+		t.Fatalf("编译本地记录: %+v", diags)
+	}
+
+	return table
+}
+
+func newManager(t *testing.T, specs map[string]upstream.Spec, groups map[string][]string) *upstream.Manager {
+	t.Helper()
+
+	manager, err := upstream.NewManager(specs, groups, discardLogger())
+	if err != nil {
+		t.Fatalf("构造上游管理器: %v", err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+
+	return manager
+}
+
+func startKernel(t *testing.T, store Store, sink func(event.Event), targets []Target) (*Server, Status) {
+	t.Helper()
+
+	return startKernelWithLogger(t, store, sink, targets, discardLogger())
+}
+
+func startKernelWithLogger(
+	t *testing.T,
+	store Store,
+	sink func(event.Event),
+	targets []Target,
+	logger *slog.Logger,
+) (*Server, Status) {
+	t.Helper()
+
+	server, err := New(Config{Store: store, Sink: sink, Logger: logger, Targets: targets})
 	if err != nil {
 		t.Fatalf("构造内核: %v", err)
 	}
-
-	addr, err = srv.Start(context.Background())
-	if err != nil {
+	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("启动内核: %v", err)
 	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(ctx)
+		_ = server.Shutdown(ctx)
 	})
 
-	return addr, ch
+	return server, server.Status()
 }
 
-// nextEvent 从事件通道取一条事件。
-func nextEvent(t *testing.T, events <-chan Event) Event {
+func testTargets() []Target {
+	return []Target{
+		{Network: "udp", Addr: "127.0.0.1:0"},
+		{Network: "tcp", Addr: "127.0.0.1:0"},
+	}
+}
+
+func exchange(t *testing.T, addr string, network string, msg *dns.Msg) *dns.Msg {
+	t.Helper()
+
+	client := &dns.Client{Net: network, Timeout: 3 * time.Second}
+	response, _, err := client.Exchange(msg, addr)
+	if err != nil {
+		t.Fatalf("查询 %s/%s: %v", addr, network, err)
+	}
+
+	return response
+}
+
+func aValues(t *testing.T, msg *dns.Msg) []string {
+	t.Helper()
+
+	if msg == nil {
+		return nil
+	}
+
+	values := make([]string, 0)
+	for _, rr := range msg.Answer {
+		if record, ok := rr.(*dns.A); ok {
+			values = append(values, record.A.String())
+		}
+	}
+
+	return values
+}
+
+func receiveEvent(t *testing.T, events <-chan event.Event) event.Event {
 	t.Helper()
 
 	select {
 	case ev := <-events:
 		return ev
-	case <-time.After(3 * time.Second):
-		t.Fatal("等待查询事件超时")
-
-		return Event{}
+	case <-time.After(2 * time.Second):
+		t.Fatal("未收到查询事件")
 	}
+
+	return event.Event{}
 }
 
-// exchange 发送一次 DNS 查询。
-func exchange(t *testing.T, network, addr, name string, qtype uint16, mutate func(*dns.Msg)) (resp *dns.Msg) {
-	t.Helper()
+func TestRoutingAndEventFields(t *testing.T) {
+	t.Parallel()
 
-	req := new(dns.Msg)
-	req.SetQuestion(dns.Fqdn(name), qtype)
-	if mutate != nil {
-		mutate(req)
-	}
-
-	client := &dns.Client{Net: network, Timeout: 3 * time.Second}
-	resp, _, err := client.Exchange(req, addr)
+	mockA, err := mockdns.StartPlain(mockdns.PlainConfig{A: []byte{192, 0, 2, 1}, TTL: 60})
 	if err != nil {
-		t.Fatalf("查询 %s %s 失败: %v", name, dns.TypeToString[qtype], err)
-	}
-
-	return resp
-}
-
-func requireA(t *testing.T, resp *dns.Msg, wantIP string) {
-	t.Helper()
-
-	if resp.Rcode != dns.RcodeSuccess {
-		t.Fatalf("期望 NOERROR，实际 %s", dns.RcodeToString[resp.Rcode])
-	}
-	if len(resp.Answer) != 1 {
-		t.Fatalf("期望 1 条应答，实际 %d 条: %v", len(resp.Answer), resp.Answer)
-	}
-	a, ok := resp.Answer[0].(*dns.A)
-	if !ok {
-		t.Fatalf("期望 A 记录，实际 %T", resp.Answer[0])
-	}
-	if got := a.A.String(); got != wantIP {
-		t.Fatalf("期望应答 %s，实际 %s", wantIP, got)
-	}
-}
-
-func TestRouterMatch(t *testing.T) {
-	router, err := NewRouter(DefaultGroup, []Rule{
-		{Kind: RuleExact, Pattern: "api.exact.test", Group: "exact"},
-		{Kind: RuleWildcard, Pattern: "*.exact.test", Group: "wild"},
-		{Kind: RuleWildcard, Pattern: "*.wild.test", Group: "wild"},
-		{Kind: RuleExact, Pattern: "onlyv6.test", Group: "v6", QTypes: []uint16{dns.TypeAAAA}},
-	})
-	if err != nil {
-		t.Fatalf("构造路由: %v", err)
-	}
-
-	cases := []struct {
-		name      string
-		qtype     uint16
-		wantGroup string
-		wantKind  string
-	}{
-		{"api.exact.test", dns.TypeA, "exact", "exact"},
-		{"API.EXACT.TEST.", dns.TypeA, "exact", "exact"},
-		{"www.api.exact.test", dns.TypeA, "wild", "wildcard"},
-		{"x.wild.test", dns.TypeA, "wild", "wildcard"},
-		{"a.b.wild.test", dns.TypeA, "wild", "wildcard"},
-		{"wild.test", dns.TypeA, DefaultGroup, "default"},
-		{"exact.test", dns.TypeA, DefaultGroup, "default"},
-		{"onlyv6.test", dns.TypeAAAA, "v6", "exact"},
-		{"onlyv6.test", dns.TypeA, DefaultGroup, "default"},
-	}
-
-	for _, tc := range cases {
-		route := router.Match(tc.name, tc.qtype)
-		if route.Group != tc.wantGroup || route.Kind != tc.wantKind {
-			t.Errorf("Match(%q, %s) = %+v，期望 group=%s kind=%s",
-				tc.name, dns.TypeToString[tc.qtype], route, tc.wantGroup, tc.wantKind)
-		}
-	}
-}
-
-func TestKernelRoutingAndEventFields(t *testing.T) {
-	mockA, err := mockdns.StartPlain(mockdns.PlainConfig{A: net.IPv4(10, 0, 0, 1), TTL: 60})
-	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("启动 mock A: %v", err)
 	}
 	t.Cleanup(func() { _ = mockA.Close() })
 
-	mockB, err := mockdns.StartPlain(mockdns.PlainConfig{A: net.IPv4(10, 0, 0, 2), TTL: 60})
+	mockB, err := mockdns.StartPlain(mockdns.PlainConfig{A: []byte{192, 0, 2, 2}, TTL: 60})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("启动 mock B: %v", err)
 	}
 	t.Cleanup(func() { _ = mockB.Close() })
 
-	mockC, err := mockdns.StartPlain(mockdns.PlainConfig{A: net.IPv4(10, 0, 0, 3), TTL: 60})
+	mockC, err := mockdns.StartPlain(mockdns.PlainConfig{A: []byte{192, 0, 2, 3}, TTL: 60})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("启动 mock C: %v", err)
 	}
 	t.Cleanup(func() { _ = mockC.Close() })
 
-	router, err := NewRouter(DefaultGroup, []Rule{
-		{Kind: RuleExact, Pattern: "api.exact.test", Group: "g-exact"},
-		{Kind: RuleWildcard, Pattern: "*.exact.test", Group: "g-wild"},
-		{Kind: RuleWildcard, Pattern: "*.wild.test", Group: "g-wild"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	manager := newManager(t,
+		map[string]upstream.Spec{
+			"a": {ID: "a", Name: "上游 A", URL: mockA.URL(), Timeout: 2 * time.Second},
+			"b": {ID: "b", Name: "上游 B", URL: mockB.URL(), Timeout: 2 * time.Second},
+			"c": {ID: "c", Name: "上游 C", URL: mockC.URL(), Timeout: 2 * time.Second},
+		},
+		map[string][]string{
+			"corp":    {"a", "b"},
+			"default": {"c"},
+		},
+	)
 
-	groups := map[string]*Group{
-		"g-exact": testGroup(t, GroupConfig{Name: "g-exact", Upstreams: []string{mockA.URL()}, CacheEnabled: true}),
-		"g-wild":  testGroup(t, GroupConfig{Name: "g-wild", Upstreams: []string{mockB.URL()}, CacheEnabled: true}),
-		DefaultGroup: testGroup(t, GroupConfig{
-			Name: "default", Upstreams: []string{mockC.URL()}, CacheEnabled: true,
+	view := &fakeView{
+		rules: compileRules(t, []rules.Rule{
+			{Kind: rules.KindDomain, Domain: "api.corp.local", Group: "corp"},
+			{Kind: rules.KindSuffix, Domain: "corp.local", Group: "corp"},
 		}),
+		groups:       manager,
+		defaultGroup: "default",
+	}
+	events := make(chan event.Event, 16)
+	_, status := startKernel(t, &fakeStore{view: view}, func(ev event.Event) { events <- ev }, testTargets())
+	if !status.Ready {
+		t.Fatalf("状态未就绪: %+v", status)
 	}
 
-	addr, events := startTestKernel(t, router, groups, nil)
-
-	// 1. 精确规则命中 + 全字段事件（UDP）。
-	requireA(t, exchange(t, "udp", addr, "api.exact.test", dns.TypeA, nil), "10.0.0.1")
-	ev := nextEvent(t, events)
-	if ev.Source != SourceUpstream || ev.CacheHit {
-		t.Errorf("首次查询来源 = %q cacheHit=%v，期望 upstream", ev.Source, ev.CacheHit)
-	}
-	if ev.Domain != "api.exact.test." || ev.QType != "A" {
-		t.Errorf("域名/类型字段错误: %q %q", ev.Domain, ev.QType)
-	}
-	if ev.RuleKind != "exact" || ev.Rule != "api.exact.test" || ev.Group != "g-exact" {
-		t.Errorf("规则字段错误: %+v", ev)
-	}
-	if ev.Protocol != "udp" {
-		t.Errorf("协议字段 = %q，期望 udp", ev.Protocol)
-	}
-	if ev.Rcode != dns.RcodeSuccess || ev.RcodeName != "NOERROR" {
-		t.Errorf("RCODE 字段错误: %d %s", ev.Rcode, ev.RcodeName)
-	}
-	if len(ev.Answers) != 1 || ev.TTL != 60 {
-		t.Errorf("应答摘要/TTL 字段错误: answers=%v ttl=%d", ev.Answers, ev.TTL)
-	}
-	if ev.DurationMS <= 0 {
-		t.Errorf("耗时字段 = %v，期望 > 0", ev.DurationMS)
-	}
-	if ev.Upstream != mockA.Addr() || !strings.Contains(ev.Upstream, "127.0.0.1") {
-		t.Errorf("上游字段 = %q，期望 %q", ev.Upstream, mockA.Addr())
-	}
-	if len(ev.Attempts) == 0 {
-		t.Errorf("缺少上游交换明细")
+	udpAddr := status.UDP[0]
+	response := exchange(t, udpAddr, "udp", newQuery("api.corp.local.", dns.TypeA))
+	if got := aValues(t, response); len(got) != 1 || (got[0] != "192.0.2.1" && got[0] != "192.0.2.2") {
+		t.Fatalf("应答 = %v", got)
 	}
 
-	// 2. 同查询命中该组缓存。
-	requireA(t, exchange(t, "udp", addr, "api.exact.test", dns.TypeA, nil), "10.0.0.1")
-	ev = nextEvent(t, events)
-	if ev.Source != SourceCache || !ev.CacheHit {
-		t.Errorf("第二次查询来源 = %q cacheHit=%v，期望 cache", ev.Source, ev.CacheHit)
+	ev := receiveEvent(t, events)
+	if ev.Domain != "api.corp.local." || ev.QType != "A" {
+		t.Fatalf("事件域名/类型 = %+v", ev)
 	}
-	if ev.Upstream != mockA.Addr() {
-		t.Errorf("缓存命中时上游字段 = %q，期望缓存条目记录 %q", ev.Upstream, mockA.Addr())
+	if ev.Time.Location() != time.UTC {
+		t.Fatalf("事件时间不是 UTC: %v", ev.Time)
 	}
-	if mockA.SeenCount() != 1 {
-		t.Errorf("mock A 实际被查询 %d 次，期望 1 次（第二次应命中缓存）", mockA.SeenCount())
+	if ev.Rule != "api.corp.local" || ev.RuleIndex != 0 || ev.RuleKind != "exact" {
+		t.Fatalf("规则字段 = %+v", ev)
 	}
-
-	// 3. 通配规则命中。
-	requireA(t, exchange(t, "udp", addr, "x.wild.test", dns.TypeA, nil), "10.0.0.2")
-	ev = nextEvent(t, events)
-	if ev.RuleKind != "wildcard" || ev.Group != "g-wild" || ev.Rule != "*.wild.test" {
-		t.Errorf("通配规则字段错误: %+v", ev)
+	if ev.Source != "upstream" || ev.Group != "corp" || ev.Protocol != "udp" {
+		t.Fatalf("来源字段 = %+v", ev)
 	}
-
-	// 4. apex 不匹配通配，落默认组。
-	requireA(t, exchange(t, "udp", addr, "wild.test", dns.TypeA, nil), "10.0.0.3")
-	ev = nextEvent(t, events)
-	if ev.RuleKind != "default" || ev.Group != DefaultGroup {
-		t.Errorf("默认组字段错误: %+v", ev)
+	if ev.Upstream == "" || ev.UpstreamName == "" || len(ev.Attempts) == 0 {
+		t.Fatalf("上游字段 = %+v", ev)
+	}
+	if ev.TTL != 60 || len(ev.Answers) != 1 {
+		t.Fatalf("应答字段 = %+v", ev)
+	}
+	if ev.EventID != 1 {
+		t.Fatalf("event_id = %d", ev.EventID)
 	}
 
-	// 5. TCP 客户端协议可观测。
-	requireA(t, exchange(t, "tcp", addr, "tcp.wild.test", dns.TypeA, nil), "10.0.0.2")
-	ev = nextEvent(t, events)
-	if ev.Protocol != "tcp" {
-		t.Errorf("TCP 查询协议字段 = %q，期望 tcp", ev.Protocol)
+	exchange(t, udpAddr, "udp", newQuery("www.corp.local.", dns.TypeA))
+	suffixEvent := receiveEvent(t, events)
+	if suffixEvent.RuleIndex != 1 || suffixEvent.RuleKind != "suffix" {
+		t.Fatalf("后缀规则事件 = %+v", suffixEvent)
+	}
+
+	exchange(t, udpAddr, "udp", newQuery("other.test.", dns.TypeA))
+	defaultEvent := receiveEvent(t, events)
+	if defaultEvent.RuleKind != "default" || defaultEvent.RuleIndex != -1 || defaultEvent.Rule != "" || defaultEvent.Group != "default" {
+		t.Fatalf("默认组事件 = %+v", defaultEvent)
+	}
+
+	exchange(t, udpAddr, "udp", newQuery("api.corp.local.", dns.TypeA))
+	cacheEvent := receiveEvent(t, events)
+	if !cacheEvent.CacheHit || cacheEvent.Source != "cache" || len(cacheEvent.Attempts) != 0 {
+		t.Fatalf("缓存事件 = %+v", cacheEvent)
+	}
+
+	tcpAddr := status.TCP[0]
+	exchange(t, tcpAddr, "tcp", newQuery("tcp.corp.local.", dns.TypeA))
+	tcpEvent := receiveEvent(t, events)
+	if tcpEvent.Protocol != "tcp" || tcpEvent.RuleIndex != 1 {
+		t.Fatalf("TCP 事件 = %+v", tcpEvent)
 	}
 }
 
-func TestKernelECSStrippedAndDOPassed(t *testing.T) {
-	mock, err := mockdns.StartPlain(mockdns.PlainConfig{A: net.IPv4(10, 1, 2, 3)})
+func TestLocalRecordsPath(t *testing.T) {
+	t.Parallel()
+
+	view := &fakeView{
+		rules: compileRules(t, nil),
+		local: compileLocal(t, []localrecords.Record{
+			{Type: localrecords.TypeA, Name: "nas.home", Value: "192.168.1.10", TTL: 60, Enabled: true},
+		}, true),
+		defaultGroup: "default",
+	}
+	events := make(chan event.Event, 4)
+	_, status := startKernel(t, &fakeStore{view: view}, func(ev event.Event) { events <- ev }, testTargets())
+
+	response := exchange(t, status.UDP[0], "udp", newQuery("nas.home.", dns.TypeA))
+	if got := aValues(t, response); len(got) != 1 || got[0] != "192.168.1.10" {
+		t.Fatalf("本地应答 = %v", got)
+	}
+	if !response.Authoritative {
+		t.Fatal("本地应答应置 AA")
+	}
+
+	ev := receiveEvent(t, events)
+	if ev.Source != "local" || ev.RuleKind != "local" || ev.Rule != "" || ev.RuleIndex != -1 {
+		t.Fatalf("本地事件 = %+v", ev)
+	}
+	if ev.Group != "" || ev.Upstream != "" || ev.UpstreamName != "" || len(ev.Attempts) != 0 {
+		t.Fatalf("本地事件上游字段 = %+v", ev)
+	}
+
+	exchange(t, status.UDP[0], "udp", newQuery("nas.home.", dns.TypeAAAA))
+	nodata := receiveEvent(t, events)
+	if nodata.Source != "local" || len(nodata.Answers) != 0 || nodata.Rcode != 0 {
+		t.Fatalf("NODATA 事件 = %+v", nodata)
+	}
+}
+
+func TestProtocolRejectsAreHandledByKernel(t *testing.T) {
+	t.Parallel()
+
+	view := &fakeView{rules: compileRules(t, nil), defaultGroup: "default"}
+	events := make(chan event.Event, 4)
+	handler := &captureHandler{}
+	_, status := startKernelWithLogger(
+		t,
+		&fakeStore{view: view},
+		func(ev event.Event) { events <- ev },
+		testTargets(),
+		slog.New(handler),
+	)
+	addr := status.UDP[0]
+
+	multiple := new(dns.Msg)
+	multiple.Id = dns.Id()
+	multiple.RecursionDesired = true
+	multiple.Question = []dns.Question{
+		{Name: "a.test.", Qtype: dns.TypeA, Qclass: dns.ClassINET},
+		{Name: "b.test.", Qtype: dns.TypeA, Qclass: dns.ClassINET},
+	}
+	if resp := exchange(t, addr, "udp", multiple); resp.Rcode != dns.RcodeFormatError {
+		t.Fatalf("多问题 RCODE = %d", resp.Rcode)
+	}
+
+	statusOpcode := newQuery("a.test.", dns.TypeA)
+	statusOpcode.Opcode = dns.OpcodeStatus
+	if resp := exchange(t, addr, "udp", statusOpcode); resp.Rcode != dns.RcodeNotImplemented {
+		t.Fatalf("非 QUERY opcode RCODE = %d", resp.Rcode)
+	}
+
+	chaos := newQuery("a.test.", dns.TypeA)
+	chaos.Question[0].Qclass = dns.ClassCHAOS
+	if resp := exchange(t, addr, "udp", chaos); resp.Rcode != dns.RcodeRefused {
+		t.Fatalf("非 IN 类 RCODE = %d", resp.Rcode)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if len(events) != 0 {
+		t.Fatalf("协议拒绝产生了事件: %d", len(events))
+	}
+
+	records := handler.snapshot()
+	if len(records) != 3 {
+		t.Fatalf("拒绝日志数量 = %d, 期望 3: %+v", len(records), records)
+	}
+	for _, record := range records {
+		if record.message != "拒绝协议级请求" {
+			t.Fatalf("日志消息 = %q", record.message)
+		}
+		for _, key := range []string{"opcode", "qdcount", "qclass"} {
+			if _, ok := record.attrs[key]; !ok {
+				t.Fatalf("日志缺少 %q: %+v", key, record.attrs)
+			}
+		}
+	}
+
+	byOpcode, ok := findRecord(records, "opcode", fmt.Sprint(dns.OpcodeStatus))
+	if !ok || byOpcode.attrs["qdcount"] != "1" || byOpcode.attrs["qclass"] != fmt.Sprint(dns.ClassINET) {
+		t.Fatalf("非 QUERY opcode 日志 = %+v", byOpcode)
+	}
+	if _, ok := findRecord(records, "qdcount", "2"); !ok {
+		t.Fatalf("缺少多问题日志: %+v", records)
+	}
+	if _, ok := findRecord(records, "qclass", fmt.Sprint(dns.ClassCHAOS)); !ok {
+		t.Fatalf("缺少非 IN 类日志: %+v", records)
+	}
+}
+
+// findRecord 按属性值查找日志记录。
+func findRecord(records []capturedRecord, key, value string) (capturedRecord, bool) {
+	for _, record := range records {
+		if record.attrs[key] == value {
+			return record, true
+		}
+	}
+
+	return capturedRecord{}, false
+}
+
+func TestInvalidMessageIsLogged(t *testing.T) {
+	t.Parallel()
+
+	view := &fakeView{rules: compileRules(t, nil), defaultGroup: "default"}
+	handler := &captureHandler{}
+	_, status := startKernelWithLogger(
+		t,
+		&fakeStore{view: view},
+		nil,
+		testTargets(),
+		slog.New(handler),
+	)
+
+	conn, err := net.Dial("udp", status.UDP[0])
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("连接内核: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	// 不足 12 字节的消息连报头都解析不了，库层会走 MsgInvalidFunc 并直接丢弃。
+	if _, err := conn.Write([]byte{0x12, 0x34, 0x01}); err != nil {
+		t.Fatalf("发送非法报文: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if record, ok := findByMessage(handler.snapshot(), "丢弃无法解析的 DNS 报文"); ok {
+			if record.attrs["bytes"] != "3" {
+				t.Fatalf("日志 bytes = %q", record.attrs["bytes"])
+			}
+			if record.attrs["error"] == "" {
+				t.Fatalf("日志缺少 error: %+v", record)
+			}
+
+			return
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("未记录无法解析报文的日志")
+}
+
+func TestAcceptDNSMessage(t *testing.T) {
+	t.Parallel()
+
+	if action := acceptDNSMessage(dns.Header{Bits: headerQRBit}); action != dns.MsgIgnore {
+		t.Fatalf("QR=1 的动作 = %v, 期望 MsgIgnore", action)
+	}
+	if action := acceptDNSMessage(dns.Header{Bits: 0}); action != dns.MsgAccept {
+		t.Fatalf("QR=0 的动作 = %v, 期望 MsgAccept", action)
+	}
+}
+
+func TestECSStrippedAndDOPreserved(t *testing.T) {
+	t.Parallel()
+
+	mock, err := mockdns.StartPlain(mockdns.PlainConfig{A: []byte{192, 0, 2, 1}, TTL: 60})
+	if err != nil {
+		t.Fatalf("启动 mock: %v", err)
 	}
 	t.Cleanup(func() { _ = mock.Close() })
 
-	router, err := NewRouter(DefaultGroup, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	groups := map[string]*Group{
-		DefaultGroup: testGroup(t, GroupConfig{Name: DefaultGroup, Upstreams: []string{mock.URL()}}),
-	}
-	addr, events := startTestKernel(t, router, groups, nil)
+	manager := newManager(t,
+		map[string]upstream.Spec{"a": {ID: "a", URL: mock.URL(), Timeout: 2 * time.Second}},
+		map[string][]string{"default": {"a"}},
+	)
+	view := &fakeView{rules: compileRules(t, nil), groups: manager, defaultGroup: "default"}
+	events := make(chan event.Event, 4)
+	_, status := startKernel(t, &fakeStore{view: view}, func(ev event.Event) { events <- ev }, testTargets())
 
-	exchange(t, "udp", addr, "ecs-probe.test", dns.TypeA, func(m *dns.Msg) {
-		m.SetEdns0(1232, true)
-		opt := m.IsEdns0()
-		opt.Option = append(opt.Option, &dns.EDNS0_SUBNET{
-			Code:          dns.EDNS0SUBNET,
-			Family:        1,
-			SourceNetmask: 24,
-			SourceScope:   0,
-			Address:       net.ParseIP("203.0.113.0").To4(),
-		})
+	query := newQuery("ecs.test.", dns.TypeA)
+	query.SetEdns0(1232, true)
+	opt := query.IsEdns0()
+	opt.Option = append(opt.Option, &dns.EDNS0_SUBNET{
+		Code:          dns.EDNS0SUBNET,
+		Family:        1,
+		SourceNetmask: 24,
+		Address:       net.IP{203, 0, 113, 0},
 	})
-	ev := nextEvent(t, events)
-	if ev.Rcode != dns.RcodeSuccess {
-		t.Fatalf("查询失败: %+v", ev)
-	}
+
+	response := exchange(t, status.UDP[0], "udp", query)
 
 	seen := mock.Seen()
 	if len(seen) != 1 {
-		t.Fatalf("mock 收到 %d 次查询，期望 1 次", len(seen))
+		t.Fatalf("上游收到 %d 条查询", len(seen))
 	}
-	opt := seen[0].IsEdns0()
-	if opt == nil {
-		t.Fatal("上游收到的查询没有 EDNS0，期望保留 DO 位")
+	seenOpt := seen[0].IsEdns0()
+	if seenOpt == nil {
+		t.Fatal("上游未收到 EDNS")
 	}
-	if !opt.Do() {
-		t.Error("上游收到的查询 DO 位丢失")
+	if !seenOpt.Do() {
+		t.Fatal("DO 位未透传")
 	}
-	for _, o := range opt.Option {
-		if o.Option() == dns.EDNS0SUBNET {
-			t.Fatalf("上游收到的查询仍带 ECS 选项，默认剥离失败: %v", o)
+	for _, option := range seenOpt.Option {
+		if option.Option() == dns.EDNS0SUBNET {
+			t.Fatal("ECS 未剥离")
+		}
+	}
+
+	if response.IsEdns0() != nil {
+		t.Fatalf("响应不应携带 OPT: %v", response.Extra)
+	}
+	ev := receiveEvent(t, events)
+	if !ev.DO {
+		t.Fatalf("事件 DO 位 = false")
+	}
+	for _, rr := range ev.Additional {
+		if strings.Contains(rr, "OPT PSEUDOSECTION") {
+			t.Fatalf("事件 additional 含 OPT 伪 RR: %q", rr)
 		}
 	}
 }
 
-func TestKernelCacheIsolationBetweenGroups(t *testing.T) {
-	mockA, err := mockdns.StartPlain(mockdns.PlainConfig{A: net.IPv4(10, 2, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = mockA.Close() })
+func TestStripOPT(t *testing.T) {
+	t.Parallel()
 
-	mockB, err := mockdns.StartPlain(mockdns.PlainConfig{A: net.IPv4(10, 2, 0, 2)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = mockB.Close() })
-
-	groupA := testGroup(t, GroupConfig{Name: "A", Upstreams: []string{mockA.URL()}, CacheEnabled: true})
-	groupB := testGroup(t, GroupConfig{Name: "B", Upstreams: []string{mockB.URL()}, CacheEnabled: true})
-
-	newReq := func() *dns.Msg {
-		m := new(dns.Msg)
-		m.SetQuestion("isolation.test.", dns.TypeA)
-
-		return m
+	msg := new(dns.Msg)
+	msg.Extra = []dns.RR{
+		&dns.A{Hdr: dns.RR_Header{Name: "ns.test.", Rrtype: dns.TypeA, Class: dns.ClassINET}},
+		&dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: 1232}},
 	}
 
-	resA1 := groupA.Resolve(context.Background(), newReq(), proxy.ProtoUDP, "127.0.0.1:1234")
-	if resA1.Error != nil {
-		t.Fatalf("组 A 首次解析失败: %v", resA1.Error)
+	stripOPT(msg)
+
+	if msg.IsEdns0() != nil {
+		t.Fatal("OPT 未被剥离")
 	}
-	resA2 := groupA.Resolve(context.Background(), newReq(), proxy.ProtoUDP, "127.0.0.1:1234")
-	if !resA2.CacheHit {
-		t.Fatalf("组 A 第二次未命中本组缓存: %+v", resA2)
+	if len(msg.Extra) != 1 || msg.Extra[0].Header().Rrtype != dns.TypeA {
+		t.Fatalf("残留附加段 = %v", msg.Extra)
 	}
 
-	resB1 := groupB.Resolve(context.Background(), newReq(), proxy.ProtoUDP, "127.0.0.1:1234")
-	if resB1.Error != nil {
-		t.Fatalf("组 B 首次解析失败: %v", resB1.Error)
-	}
-	if resB1.CacheHit {
-		t.Fatalf("组 B 首次命中缓存，说明缓存跨组共享: %+v", resB1)
+	// nil 与无附加段的消息必须安全通过。
+	stripOPT(nil)
+	stripOPT(new(dns.Msg))
+}
+
+func TestUpstreamFailureProducesSERVFAIL(t *testing.T) {
+	t.Parallel()
+
+	manager := newManager(t,
+		map[string]upstream.Spec{"bad": {ID: "bad", URL: "tcp://127.0.0.1:1", Timeout: 200 * time.Millisecond}},
+		map[string][]string{"default": {"bad"}},
+	)
+	view := &fakeView{rules: compileRules(t, nil), groups: manager, defaultGroup: "default"}
+	events := make(chan event.Event, 4)
+	_, status := startKernel(t, &fakeStore{view: view}, func(ev event.Event) { events <- ev }, testTargets())
+
+	response := exchange(t, status.UDP[0], "udp", newQuery("fail.test.", dns.TypeA))
+	if response.Rcode != dns.RcodeServerFailure {
+		t.Fatalf("RCODE = %d", response.Rcode)
 	}
 
-	resA3 := groupA.Resolve(context.Background(), newReq(), proxy.ProtoUDP, "127.0.0.1:1234")
-	if !resA3.CacheHit {
-		t.Fatalf("再次查询组 A 未命中缓存: %+v", resA3)
+	ev := receiveEvent(t, events)
+	if ev.Source != "upstream" || ev.Error == "" {
+		t.Fatalf("失败事件 = %+v", ev)
 	}
-
-	ipA1 := firstA(t, resA1.Response)
-	ipB1 := firstA(t, resB1.Response)
-	if ipA1 != "10.2.0.1" || ipB1 != "10.2.0.2" || ipA1 == ipB1 {
-		t.Fatalf("缓存串组: A=%s B=%s", ipA1, ipB1)
+	if ev.Upstream != "" || ev.UpstreamName != "" || len(ev.Answers) != 0 || ev.TTL != 0 {
+		t.Fatalf("失败事件字段 = %+v", ev)
 	}
-	if mockA.SeenCount() != 1 || mockB.SeenCount() != 1 {
-		t.Fatalf("上游被查询次数异常: A=%d B=%d，期望各 1 次", mockA.SeenCount(), mockB.SeenCount())
+	if len(ev.Attempts) == 0 {
+		t.Fatal("失败事件应包含 attempts")
 	}
 }
 
-func TestKernelUpstreamFailureProducesSERVFAIL(t *testing.T) {
-	router, err := NewRouter(DefaultGroup, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	groups := map[string]*Group{
-		DefaultGroup: testGroup(t, GroupConfig{
-			Name:      DefaultGroup,
-			Upstreams: []string{"tcp://127.0.0.1:1"},
-			Timeout:   300 * time.Millisecond,
-			// 缓存关闭，避免负缓存干扰。
-		}),
-	}
-	addr, events := startTestKernel(t, router, groups, nil)
+func TestStatusSlicesAreNonNil(t *testing.T) {
+	t.Parallel()
 
-	resp := exchange(t, "udp", addr, "fail.test", dns.TypeA, nil)
-	if resp.Rcode != dns.RcodeServerFailure {
-		t.Fatalf("上游全失败时应答 RCODE = %s，期望 SERVFAIL", dns.RcodeToString[resp.Rcode])
+	// 未启动的内核没有任何监听地址，但状态切片必须是非 nil 空切片，JSON 才会
+	// 输出 [] 而不是 null。
+	server, err := New(Config{Store: &fakeStore{view: &fakeView{}}, Targets: testTargets()})
+	if err != nil {
+		t.Fatalf("构造内核: %v", err)
 	}
-	ev := nextEvent(t, events)
-	if ev.Error == "" {
-		t.Error("上游失败事件缺少错误信息")
+	status := server.Status()
+	if status.UDP == nil || status.TCP == nil {
+		t.Fatalf("监听地址切片为 nil: %+v", status)
 	}
-	if ev.Source != SourceUpstream {
-		t.Errorf("失败事件来源 = %q，期望 upstream", ev.Source)
+	if len(status.UDP) != 0 || len(status.TCP) != 0 {
+		t.Fatalf("未启动内核的监听地址 = %+v", status)
+	}
+
+	// 绑定失败时 Targets 也不能是 nil。
+	_, failed := startKernel(t, &fakeStore{view: &fakeView{}}, nil, []Target{
+		{Network: "udp", Addr: "not-an-address"},
+	})
+	if failed.BindError == nil {
+		t.Fatal("绑定失败应产生 BindError")
+	}
+	if failed.BindError.Targets == nil {
+		t.Fatalf("BindError.Targets 为 nil: %+v", failed.BindError)
 	}
 }
 
-func TestKernelLocalSourceAndNODATA(t *testing.T) {
-	mock, err := mockdns.StartPlain(mockdns.PlainConfig{A: net.IPv4(10, 3, 0, 1)})
+func TestPartialBindFailureStillServes(t *testing.T) {
+	t.Parallel()
+
+	view := &fakeView{
+		rules: compileRules(t, nil),
+		local: compileLocal(t, []localrecords.Record{
+			{Type: localrecords.TypeA, Name: "test.home", Value: "192.168.1.1", TTL: 60, Enabled: true},
+		}, true),
+		defaultGroup: "default",
+	}
+	_, status := startKernel(t, &fakeStore{view: view}, nil, []Target{
+		{Network: "udp", Addr: "127.0.0.1:0"},
+		{Network: "tcp", Addr: "not-an-address"},
+	})
+
+	if status.Ready {
+		t.Fatal("部分绑定失败时 Ready 应为 false")
+	}
+	if status.BindError == nil || len(status.BindError.Targets) != 1 {
+		t.Fatalf("BindError = %+v", status.BindError)
+	}
+	if len(status.UDP) != 1 {
+		t.Fatalf("UDP 地址 = %v", status.UDP)
+	}
+
+	response := exchange(t, status.UDP[0], "udp", newQuery("test.home.", dns.TypeA))
+	if got := aValues(t, response); len(got) != 1 {
+		t.Fatalf("应答 = %v", got)
+	}
+}
+
+func TestUDPTruncation(t *testing.T) {
+	t.Parallel()
+
+	view := &fakeView{
+		rules: compileRules(t, nil),
+		local: compileLocal(t, []localrecords.Record{
+			{Type: localrecords.TypeTXT, Name: "big.home", Value: strings.Repeat("a", 1024), TTL: 60, Enabled: true},
+		}, true),
+		defaultGroup: "default",
+	}
+	_, status := startKernel(t, &fakeStore{view: view}, nil, testTargets())
+
+	response := exchange(t, status.UDP[0], "udp", newQuery("big.home.", dns.TypeTXT))
+	if !response.Truncated {
+		t.Fatalf("UDP 应答未截断，长度=%d", response.Len())
+	}
+}
+
+func TestKernelOverheadP50P99(t *testing.T) {
+	if testing.Short() || raceEnabled {
+		t.Skip("short 或 race 模式跳过时序基准")
+	}
+
+	mock, err := mockdns.StartPlain(mockdns.PlainConfig{A: []byte{192, 0, 2, 1}, TTL: 60})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("启动 mock: %v", err)
 	}
 	t.Cleanup(func() { _ = mock.Close() })
 
-	router, err := NewRouter(DefaultGroup, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	groups := map[string]*Group{
-		DefaultGroup: testGroup(t, GroupConfig{Name: DefaultGroup, Upstreams: []string{mock.URL()}}),
-	}
+	manager := newManager(t,
+		map[string]upstream.Spec{"a": {ID: "a", URL: mock.URL(), Timeout: 2 * time.Second}},
+		map[string][]string{"default": {"a"}},
+	)
+	view := &fakeView{rules: compileRules(t, nil), groups: manager, defaultGroup: "default"}
+	_, status := startKernel(t, &fakeStore{view: view}, nil, testTargets())
+	kernelAddr := status.UDP[0]
+	mockAddr := mock.Addr()
 
-	local := func(q dns.Question) (answers []dns.RR, nameExists bool) {
-		if strings.EqualFold(q.Name, "nas.home.") {
-			if q.Qtype != dns.TypeA {
-				return nil, true
-			}
+	kernelClient := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
+	directClient := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
 
-			return []dns.RR{&dns.A{
-				Hdr: dns.RR_Header{
-					Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60,
-				},
-				A: net.IPv4(192, 168, 1, 10),
-			}}, true
+	const samples = 500
+	overheads := make([]time.Duration, 0, samples)
+
+	for i := 0; i < samples; i++ {
+		domain := fmt.Sprintf("q-%d.test.", i)
+
+		start := time.Now()
+		if _, _, err := directClient.Exchange(newQuery(domain, dns.TypeA), mockAddr); err != nil {
+			t.Fatalf("直连查询: %v", err)
 		}
+		direct := time.Since(start)
 
-		return nil, false
-	}
+		start = time.Now()
+		if _, _, err := kernelClient.Exchange(newQuery(domain, dns.TypeA), kernelAddr); err != nil {
+			t.Fatalf("内核查询: %v", err)
+		}
+		kernel := time.Since(start)
 
-	addr, events := startTestKernel(t, router, groups, local)
-
-	requireA(t, exchange(t, "udp", addr, "nas.home", dns.TypeA, nil), "192.168.1.10")
-	ev := nextEvent(t, events)
-	if ev.Source != SourceLocal || ev.RuleKind != "local" {
-		t.Errorf("本地应答来源字段错误: %+v", ev)
-	}
-	if ev.Upstream != "" || len(ev.Attempts) != 0 {
-		t.Errorf("本地应答不应有上游字段: %+v", ev)
+		overheads = append(overheads, kernel-direct)
 	}
 
-	resp := exchange(t, "udp", addr, "nas.home", dns.TypeAAAA, nil)
-	if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 0 {
-		t.Errorf("AAAA 应返回 NODATA（NOERROR 空应答），实际 rcode=%s answers=%v",
-			dns.RcodeToString[resp.Rcode], resp.Answer)
+	sort.Slice(overheads, func(i, j int) bool { return overheads[i] < overheads[j] })
+	p50 := overheads[len(overheads)*50/100]
+	p99 := overheads[len(overheads)*99/100]
+
+	t.Logf("内核额外开销 p50=%v p99=%v", p50, p99)
+	if p50 > time.Millisecond {
+		t.Fatalf("p50 = %v，超过 1ms", p50)
 	}
-	ev = nextEvent(t, events)
-	if ev.Source != SourceLocal {
-		t.Errorf("NODATA 来源 = %q，期望 local", ev.Source)
-	}
-	if mock.SeenCount() != 0 {
-		t.Errorf("本地记录命中时不应查询上游，实际查询 %d 次", mock.SeenCount())
+	if p99 > 5*time.Millisecond {
+		t.Fatalf("p99 = %v，超过 5ms", p99)
 	}
 }
 
-func TestKernelFallbackAndParallel(t *testing.T) {
-	primary1, err := mockdns.StartPlain(mockdns.PlainConfig{A: net.IPv4(10, 4, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = primary1.Close() })
+func newQuery(domain string, qtype uint16) *dns.Msg {
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(domain), qtype)
+	msg.RecursionDesired = true
 
-	primary2, err := mockdns.StartPlain(mockdns.PlainConfig{A: net.IPv4(10, 4, 0, 2)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = primary2.Close() })
-
-	fallback, err := mockdns.StartPlain(mockdns.PlainConfig{A: net.IPv4(10, 4, 9, 9)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = fallback.Close() })
-
-	// 主备：主上游不可用，fallback 应答。
-	router, err := NewRouter("fallback", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	groups := map[string]*Group{
-		"fallback": testGroup(t, GroupConfig{
-			Name:      "fallback",
-			Upstreams: []string{"tcp://127.0.0.1:1"},
-			Fallbacks: []string{fallback.URL()},
-			Timeout:   500 * time.Millisecond,
-		}),
-	}
-	addr, events := startTestKernel(t, router, groups, nil)
-
-	requireA(t, exchange(t, "udp", addr, "fb.test", dns.TypeA, nil), "10.4.9.9")
-	ev := nextEvent(t, events)
-	if ev.Upstream != fallback.Addr() {
-		t.Errorf("主备切换后上游字段 = %q，期望 fallback %q", ev.Upstream, fallback.Addr())
-	}
-	sawFallback, sawPrimaryError := false, false
-	for _, attempt := range ev.Attempts {
-		if attempt.Fallback {
-			sawFallback = true
-		}
-		if !attempt.Fallback && attempt.Error != "" {
-			sawPrimaryError = true
-		}
-	}
-	if !sawFallback || !sawPrimaryError {
-		t.Errorf("主备尝试明细不完整: %+v", ev.Attempts)
-	}
-
-	// 并发模式：两个主上游都应被并发尝试。
-	routerParallel, err := NewRouter("parallel", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	groupsParallel := map[string]*Group{
-		"parallel": testGroup(t, GroupConfig{
-			Name:      "parallel",
-			Upstreams: []string{primary1.URL(), primary2.URL()},
-			Mode:      proxy.UpstreamModeParallel,
-		}),
-	}
-	addrParallel, eventsParallel := startTestKernel(t, routerParallel, groupsParallel, nil)
-
-	parallelResp := exchange(t, "udp", addrParallel, "parallel.test", dns.TypeA, nil)
-	if parallelResp.Rcode != dns.RcodeSuccess || len(parallelResp.Answer) != 1 {
-		t.Fatalf("并发模式查询失败: %v %v", parallelResp.Rcode, parallelResp.Answer)
-	}
-	ip := firstA(t, parallelResp)
-	if ip != "10.4.0.1" && ip != "10.4.0.2" {
-		t.Fatalf("并发模式应答 IP = %s，期望来自两个主上游之一", ip)
-	}
-	ev = nextEvent(t, eventsParallel)
-	// dnsproxy 的 parallel 模式在第一个成功应答后立即返回，落败上游的交换
-	// 可能在事件快照之后才结束，因此这里只要求至少记录到胜出上游。
-	if len(ev.Attempts) == 0 {
-		t.Errorf("并发模式没有记录任何上游尝试: %+v", ev)
-	}
-	for _, attempt := range ev.Attempts {
-		if attempt.Error != "" {
-			t.Errorf("并发模式上游尝试出现错误: %+v", ev.Attempts)
-		}
-	}
-}
-
-func TestEncryptedUpstreamsAndTLSVerification(t *testing.T) {
-	plain, err := mockdns.StartPlain(mockdns.PlainConfig{A: net.IPv4(10, 5, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = plain.Close() })
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	enc, err := mockdns.StartEncrypted(ctx, plain.URL())
-	if err != nil {
-		t.Fatalf("启动加密 mock: %v", err)
-	}
-	t.Cleanup(func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutdownCancel()
-		_ = enc.Close(shutdownCtx)
-	})
-
-	router, err := NewRouter("doh", []Rule{
-		{Kind: RuleExact, Pattern: "dot.test", Group: "dot"},
-		{Kind: RuleExact, Pattern: "doq.test", Group: "doq"},
-		{Kind: RuleExact, Pattern: "untrusted.test", Group: "untrusted"},
-		{Kind: RuleExact, Pattern: "insecure.test", Group: "insecure"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	groups := map[string]*Group{
-		"doh": testGroup(t, GroupConfig{
-			Name: "doh", Upstreams: []string{enc.DoHURL()}, RootCAs: enc.RootCAs(), Timeout: 3 * time.Second,
-		}),
-		"dot": testGroup(t, GroupConfig{
-			Name: "dot", Upstreams: []string{enc.DoTURL()}, RootCAs: enc.RootCAs(), Timeout: 3 * time.Second,
-		}),
-		"doq": testGroup(t, GroupConfig{
-			Name: "doq", Upstreams: []string{enc.DoQURL()}, RootCAs: enc.RootCAs(), Timeout: 3 * time.Second,
-		}),
-		// 默认系统根证书：自签证书校验失败。
-		"untrusted": testGroup(t, GroupConfig{
-			Name: "untrusted", Upstreams: []string{enc.DoHURL()}, Timeout: 3 * time.Second,
-		}),
-		// 显式关闭校验：仅用于验证高级开关可用。
-		"insecure": testGroup(t, GroupConfig{
-			Name: "insecure", Upstreams: []string{enc.DoHURL()}, InsecureSkipVerify: true, Timeout: 3 * time.Second,
-		}),
-	}
-	if enc.DoH3URL() != "" {
-		groups["doh3"] = testGroup(t, GroupConfig{
-			Name: "doh3", Upstreams: []string{enc.DoH3URL()}, RootCAs: enc.RootCAs(), Timeout: 3 * time.Second,
-		})
-	}
-
-	// DoH3 规则按实际启动结果注册（启动失败时跳过该协议）。
-	rules := []Rule{
-		{Kind: RuleExact, Pattern: "dot.test", Group: "dot"},
-		{Kind: RuleExact, Pattern: "doq.test", Group: "doq"},
-	}
-	if _, ok := groups["doh3"]; ok {
-		rules = append(rules, Rule{Kind: RuleExact, Pattern: "doh3.test", Group: "doh3"})
-	}
-	router, err = NewRouter("doh", append(rules,
-		Rule{Kind: RuleExact, Pattern: "untrusted.test", Group: "untrusted"},
-		Rule{Kind: RuleExact, Pattern: "insecure.test", Group: "insecure"},
-	))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	addr, events := startTestKernel(t, router, groups, nil)
-
-	// DoH / DoT / DoQ / DoH3 均应成功。
-	for _, name := range []string{"doh.test", "dot.test", "doq.test", "doh3.test"} {
-		group := strings.TrimSuffix(name, ".test")
-		if groups[group] == nil {
-			t.Logf("跳过 %s：本地 mock 的 DoH3 未启动（%v）", name, enc.H3Error())
-			continue
-		}
-
-		resp := exchange(t, "udp", addr, name, dns.TypeA, nil)
-		requireA(t, resp, "10.5.0.1")
-		ev := nextEvent(t, events)
-		if ev.Rcode != dns.RcodeSuccess || ev.Error != "" {
-			t.Errorf("%s 加密上游失败: %+v", name, ev)
-		}
-	}
-	// 未配置 RootCAs 时必须证书校验失败。
-	resp := exchange(t, "udp", addr, "untrusted.test", dns.TypeA, nil)
-	if resp.Rcode != dns.RcodeServerFailure {
-		t.Errorf("自签证书默认校验应失败并返回 SERVFAIL，实际 %s", dns.RcodeToString[resp.Rcode])
-	}
-	ev := nextEvent(t, events)
-	if ev.Error == "" {
-		t.Error("证书校验失败事件缺少错误信息")
-	}
-
-	// 显式关闭校验后应成功。
-	requireA(t, exchange(t, "udp", addr, "insecure.test", dns.TypeA, nil), "10.5.0.1")
-	ev = nextEvent(t, events)
-	if ev.Error != "" {
-		t.Errorf("InsecureSkipVerify 解析失败: %+v", ev)
-	}
-}
-
-func TestKernelLoadBalanceDistribution(t *testing.T) {
-	mockA, err := mockdns.StartPlain(mockdns.PlainConfig{A: net.IPv4(10, 7, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = mockA.Close() })
-
-	mockB, err := mockdns.StartPlain(mockdns.PlainConfig{A: net.IPv4(10, 7, 0, 2)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = mockB.Close() })
-
-	router, err := NewRouter(DefaultGroup, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	groups := map[string]*Group{
-		DefaultGroup: testGroup(t, GroupConfig{
-			Name:      DefaultGroup,
-			Upstreams: []string{mockA.URL(), mockB.URL()},
-			Mode:      proxy.UpstreamModeLoadBalance,
-		}),
-	}
-	addr, events := startTestKernel(t, router, groups, nil)
-
-	const queries = 40
-	for i := 0; i < queries; i++ {
-		name := fmt.Sprintf("lb-%d.test", i)
-		requireAnyA(t, exchange(t, "udp", addr, name, dns.TypeA, nil))
-		nextEvent(t, events)
-	}
-
-	// dnsproxy 的 load_balance 是按 RTT 权重的随机选择，不是严格轮询；
-	// 这里只验证两个上游都被使用过，不约束分布比例。
-	if mockA.SeenCount() == 0 || mockB.SeenCount() == 0 {
-		t.Fatalf("load_balance 未使用全部上游: A=%d B=%d", mockA.SeenCount(), mockB.SeenCount())
-	}
-	t.Logf("load_balance %d 次查询分布: A=%d B=%d", queries, mockA.SeenCount(), mockB.SeenCount())
-}
-
-// requireAnyA 断言应答成功且至少有一条 A 记录。
-func requireAnyA(t *testing.T, resp *dns.Msg) {
-	t.Helper()
-
-	if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) == 0 {
-		t.Fatalf("期望成功应答，实际 rcode=%s answers=%v", dns.RcodeToString[resp.Rcode], resp.Answer)
-	}
-}
-
-func firstA(t *testing.T, msg *dns.Msg) string {
-	t.Helper()
-
-	if msg == nil || len(msg.Answer) == 0 {
-		t.Fatal("应答为空")
-	}
-	a, ok := msg.Answer[0].(*dns.A)
-	if !ok {
-		t.Fatalf("期望 A 记录，实际 %T", msg.Answer[0])
-	}
-
-	return a.A.String()
+	return msg
 }
