@@ -22,11 +22,18 @@ serde_json = "1"
 # 启动随机 token：系统 CSPRNG。
 getrandom = "0.3"
 # Windows Job Object：保证 Tauri 被强杀时 sidecar 一起结束。
+# IP Helper 用于端口占用归因与网卡 DNS 读取，WinSock/Ndis 提供地址族与接口类型，
+# WindowsAndMessaging 提供退出提醒的原生消息框。
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_System_JobObjects",
+    "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [profile.release]

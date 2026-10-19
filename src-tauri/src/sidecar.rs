@@ -22,14 +22,21 @@ const READY_PREFIX: &str = "NAMESPLIT_READY ";
 const CONFIG_ERROR_PREFIX: &str = "NAMESPLIT_CONFIG_ERROR ";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// sidecar 可执行文件位置：优先使用 tauri-build 从 externalBin 复制到当前 exe 同目录的副本，
-/// 回退到仓库内构建产物（便于 `cargo run` 直接调试）。
+/// sidecar 可执行文件位置：开发构建优先使用仓库内 `build/` 的产物，
+/// 打包后使用 tauri-build 复制到 exe 同目录的 externalBin 副本。
 pub fn sidecar_path() -> PathBuf {
     let exe_name = if cfg!(windows) {
         "namesplit-core.exe"
     } else {
         "namesplit-core"
     };
+    let repo_build = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../build")
+        .join(exe_name);
+
+    if cfg!(debug_assertions) && repo_build.is_file() {
+        return repo_build;
+    }
     if let Ok(current) = std::env::current_exe() {
         if let Some(dir) = current.parent() {
             let candidate = dir.join(exe_name);
@@ -38,9 +45,7 @@ pub fn sidecar_path() -> PathBuf {
             }
         }
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../build")
-        .join(exe_name)
+    repo_build
 }
 
 pub fn supervise(app: AppHandle, rt: Arc<Runtime>) {
