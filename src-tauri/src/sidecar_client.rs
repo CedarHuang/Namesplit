@@ -99,6 +99,47 @@ impl SidecarClient {
         self.request_json("POST", path)
     }
 
+    pub fn delete_json(&self, path: &str) -> Result<serde_json::Value, ClientError> {
+        self.request_json("DELETE", path)
+    }
+
+    /// 带 JSON 请求体的 POST；用于配置校验、规则测试、上游测试等命令。
+    pub fn post_json_body(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.request_json_body("POST", path, body)
+    }
+
+    pub fn put_json_body(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.request_json_body("PUT", path, body)
+    }
+
+    fn request_json_body(
+        &self,
+        method: &str,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        let encoded = serde_json::to_string(body)?;
+        let mut stream = self.connect(JSON_TIMEOUT)?;
+        self.write_request(&mut stream, method, path, "application/json", &encoded)?;
+        let response = read_response(stream)?;
+        let text = response.body.into_string(1024 * 1024)?;
+        if !(200..300).contains(&response.status) {
+            return Err(ClientError::Http {
+                status: response.status,
+                body: text,
+            });
+        }
+        Ok(serde_json::from_str(&text)?)
+    }
+
     fn request_json(&self, method: &str, path: &str) -> Result<serde_json::Value, ClientError> {
         let mut stream = self.connect(JSON_TIMEOUT)?;
         self.write_request(&mut stream, method, path, "application/json", "")?;

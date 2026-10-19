@@ -2,17 +2,15 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use serde_json::json;
 use tauri::{AppHandle, Emitter};
 
 use crate::job;
-use crate::relay::{self, RelayStats, TauriBatchSink};
+use crate::relay_control;
 use crate::runtime::{
     Runtime, BACKOFF_BASE_MS, BACKOFF_MAX_MS, MAX_RESTARTS_PER_WINDOW, RESTART_WINDOW_SECS,
 };
@@ -48,14 +46,22 @@ pub fn sidecar_path() -> PathBuf {
     repo_build
 }
 
+/// 启动 sidecar 监护循环。
+///
+/// 调用方必须先经 `Runtime::claim_supervisor` 抢占启动权；本线程退出（任意路径）时
+/// `SupervisorFlag` 负责释放，供手动重启再次抢占。
 pub fn supervise(app: AppHandle, rt: Arc<Runtime>) {
+    debug_assert!(
+        rt.supervisor_running
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "调用 supervise 前必须先取得监护线程启动权"
+    );
+    let _supervisor = SupervisorFlag(rt.clone());
     loop {
         if rt.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             rt.log("应用正在退出，监护线程结束");
             return;
         }
-        let mut relay_stop: Option<Arc<AtomicBool>> = None;
-        let mut relay_stats: Option<Arc<RelayStats>> = None;
 
         let (mut child, stderr_thread) = match spawn_once(&rt) {
             Ok(pair) => pair,
@@ -79,18 +85,9 @@ pub fn supervise(app: AppHandle, rt: Arc<Runtime>) {
                 ));
                 emit_state(&app, &rt, "running", None, None);
 
-                // READY 之后才建立事件流；端口与 token 只在本进程内使用，不进入 Tauri 事件。
-                let stop = Arc::new(AtomicBool::new(false));
-                let stats = Arc::new(RelayStats::default());
-                let sink = Arc::new(TauriBatchSink::new(app.clone()));
-                let _handle = relay::spawn(
-                    relay::RelayConfig::new(*port, rt.token.clone()),
-                    sink,
-                    stop.clone(),
-                    stats.clone(),
-                );
-                relay_stop = Some(stop);
-                relay_stats = Some(stats);
+                // 事件流是否建立由订阅意图决定：未订阅时 READY 不建流，避免窗口隐藏
+                // （已取消订阅）期间 sidecar 重启又把事件流悄悄接回来。
+                relay_control::sidecar_ready(&app, &rt, *port);
             }
             None => {
                 rt.log("sidecar 在就绪前退出或就绪超时");
@@ -107,11 +104,9 @@ pub fn supervise(app: AppHandle, rt: Arc<Runtime>) {
             let _ = handle.join();
         }
         rt.clear_ready();
-        if let Some(stop) = relay_stop.take() {
-            stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        if let Some(stats) = relay_stats.take() {
-            let snapshot = stats.snapshot();
+        // 先停止事件流再判断退出原因：端口已失效，继续重连没有意义；
+        // 订阅意图保留，sidecar 重新就绪后由 READY 分支按新端口重建。
+        if let Some(snapshot) = relay_control::sidecar_exited(&rt) {
             // 连接失败/401 时 events 为 0，仍需把 last_error 落盘。
             if snapshot.events > 0 || snapshot.dropped_events > 0 || snapshot.last_error.is_some() {
                 rt.log(&format!(
@@ -184,6 +179,17 @@ pub fn supervise(app: AppHandle, rt: Arc<Runtime>) {
                 std::thread::sleep(Duration::from_millis(backoff_ms));
             }
         }
+    }
+}
+
+/// 监护线程退出（任意路径）时清除运行标记，允许手动重启。
+struct SupervisorFlag(Arc<Runtime>);
+
+impl Drop for SupervisorFlag {
+    fn drop(&mut self) {
+        self.0
+            .supervisor_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -263,26 +269,18 @@ fn wait_ready(rt: &Arc<Runtime>, child: &mut Child, timeout: Duration) -> Option
     }
 }
 
-fn emit_state(
+pub(crate) fn emit_state(
     app: &AppHandle,
     rt: &Runtime,
     state: &str,
     reason: Option<&str>,
     config_error: Option<&serde_json::Value>,
 ) {
-    // 只上报生命周期状态；端口与 token 留在 Rust 侧，不进入渲染器可见事件。
-    let mut payload = json!({
-        "state": state,
-        "pid": rt.sidecar_pid.load(std::sync::atomic::Ordering::SeqCst),
-        "restart_count": rt.restart_count(),
-    });
-    if let Some(reason) = reason {
-        payload["reason"] = json!(reason);
-    }
-    if let Some(config_error) = config_error {
-        payload["config_error"] = config_error.clone();
-    }
+    // 载荷同时写入状态快照，渲染器重载后调用 sidecar_state 能读到与事件一致的形状。
+    // 端口与 token 不进入渲染器可见的载荷。
+    let payload = rt.record_sidecar_state(state, reason, config_error);
     let _ = app.emit("sidecar://state", payload);
+    crate::tray::refresh_status(app);
 }
 
 fn mark_failed(rt: &Runtime, reason: &str) {

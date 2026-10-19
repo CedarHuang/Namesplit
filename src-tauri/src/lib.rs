@@ -1,14 +1,19 @@
 // Namesplit 应用侧：窗口/托盘/单实例/sidecar 监护。
 mod autostart;
+mod commands;
 mod ipc;
 mod job;
 pub mod port_status;
+mod prefs;
 pub mod relay;
+mod relay_control;
 pub mod runtime;
 mod sidecar;
 pub mod sidecar_client;
 pub mod system_dns;
 mod timefmt;
+mod tray;
+mod webview_guard;
 
 use std::sync::Arc;
 
@@ -38,9 +43,11 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .default_window_icon()
         .cloned()
         .ok_or_else(|| tauri::Error::AssetNotFound("default window icon".into()))?;
+    let icons = tray::TrayIcons::create(&icon);
+    app.manage(icons.clone());
 
     TrayIconBuilder::with_id("main-tray")
-        .icon(icon)
+        .icon(icons.image(tray::Status::Warning))
         .tooltip("Namesplit")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -63,6 +70,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             }
         })
         .build(app)?;
+    tray::refresh_status(app.handle());
     Ok(())
 }
 
@@ -112,12 +120,35 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main(app);
         }))
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
             port_status::port_status,
             system_dns::system_dns_get,
             autostart::autostart_get,
             autostart::autostart_set,
-            ipc::open_system_network_settings
+            ipc::open_system_network_settings,
+            ipc::app_info,
+            ipc::open_data_dir,
+            ipc::open_config_file,
+            prefs::prefs_get,
+            prefs::prefs_set,
+            webview_guard::ui_heartbeat,
+            commands::config_get,
+            commands::config_validate,
+            commands::config_save,
+            commands::config_reset,
+            commands::rules_test,
+            commands::queries_list,
+            commands::queries_clear,
+            commands::stats_get,
+            commands::stats_minute,
+            commands::stats_top,
+            commands::status_get,
+            commands::upstream_test,
+            commands::events_subscribe,
+            commands::events_unsubscribe,
+            commands::sidecar_state,
+            commands::sidecar_restart
         ])
         .setup(|app| {
             let rt = Arc::new(Runtime::new()?);
@@ -136,8 +167,18 @@ pub fn run() {
             let monitor = system_dns::DnsMonitor::start(app.handle().clone());
             app.manage(monitor);
 
+            let guard = webview_guard::RendererGuard::start(app.handle().clone());
+            app.manage(guard);
+            webview_guard::install_process_failed_hook(app.handle());
+
             let handle = app.handle().clone();
-            std::thread::spawn(move || sidecar::supervise(handle, rt));
+            // 先抢占监护线程启动权再起线程：启动流程与手动重启共用同一次 CAS，
+            // 避免两边都认为自己该拉起 sidecar。
+            if rt.claim_supervisor() {
+                std::thread::spawn(move || sidecar::supervise(handle, rt));
+            } else {
+                rt.log("启动时未取得 sidecar 监护线程启动权，跳过自动启动");
+            }
             Ok(())
         })
         .on_window_event(|window, event| match event {

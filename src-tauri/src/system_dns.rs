@@ -350,6 +350,7 @@ fn refresh_and_emit(app: &AppHandle, last: &mut Option<SystemDnsStatus>) {
     *last = Some(status.clone());
     let _ = app.emit(DNS_CHANGED_EVENT, &status);
     log(app, "系统 DNS 状态已变化，已推送 system_dns://changed");
+    crate::tray::refresh_status(app);
 }
 
 fn interfaces_changed(previous: Option<&SystemDnsStatus>, current: &SystemDnsStatus) -> bool {

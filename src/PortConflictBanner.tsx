@@ -1,4 +1,7 @@
 import { Alert, Button, Typography } from "antd";
+
+import { useI18n } from "./i18n";
+import type { MessageKey } from "./i18n";
 import type { PortHolder, PortStatus, PortTarget } from "./portStatus";
 
 const { Text } = Typography;
@@ -13,30 +16,24 @@ function isConflicting(target: PortTarget): boolean {
     return false;
   }
   if (target.status === "unknown") {
-    // 无法绑定且无法归因（保留端口/权限限制），按冲突提示处理。
     return true;
   }
-  // in_use：系统表未给出持有者时不能排除外部占用；有持有者时只认非自身占用。
   return target.holders.length === 0 || externalHolders(target).length > 0;
 }
 
-function stateLabel(target: PortTarget): string {
-  return target.status === "unknown" ? "无法绑定（可能为保留端口或权限受限）" : "已被占用";
-}
-
-function holderHint(holders: PortHolder[]): string | null {
+function holderHint(holders: PortHolder[]): MessageKey | null {
   const names = holders.map((holder) => holder.name.toLowerCase()).join(" ");
   if (/svchost|system/.test(names)) {
-    return "可能是 Internet 连接共享（ICS）、移动热点或系统服务占用。";
+    return "port.hintIcs";
   }
   if (/docker/.test(names)) {
-    return "可能是 Docker Desktop 的端口转发。";
+    return "port.hintDocker";
   }
   if (/wsl/.test(names)) {
-    return "可能是 WSL 的端口转发。";
+    return "port.hintWsl";
   }
   if (holders.length === 0) {
-    return "可能是 Hyper-V / WSL / Docker 的保留端口，或当前用户无权查询占用进程。";
+    return "port.hintReserved";
   }
   return null;
 }
@@ -46,6 +43,7 @@ export function PortConflictBanner(props: {
   error: string | null;
   onRefresh: () => void;
 }) {
+  const { t } = useI18n();
   const { status, error, onRefresh } = props;
 
   if (error) {
@@ -54,11 +52,11 @@ export function PortConflictBanner(props: {
         type="warning"
         showIcon
         style={{ marginBottom: 16 }}
-        message="53 端口检测失败"
+        title={t("port.title")}
         description={error}
         action={
           <Button size="small" onClick={onRefresh}>
-            重新检测
+            {t("port.retry")}
           </Button>
         }
       />
@@ -74,7 +72,7 @@ export function PortConflictBanner(props: {
     new Set(
       conflicts
         .map((target) => holderHint(externalHolders(target)))
-        .filter((hint): hint is string => hint !== null),
+        .filter((hint): hint is MessageKey => hint !== null),
     ),
   );
   const hasOccupied = conflicts.some((target) => target.status === "in_use");
@@ -84,11 +82,7 @@ export function PortConflictBanner(props: {
       type="warning"
       showIcon
       style={{ marginBottom: 16 }}
-      message={
-        hasOccupied
-          ? "53 端口冲突：DNS 解析无法监听"
-          : "53 端口无法绑定：DNS 解析无法监听"
-      }
+      title={hasOccupied ? t("port.conflict") : t("port.bindFailed")}
       description={
         <div>
           {conflicts.map((target) => {
@@ -98,36 +92,35 @@ export function PortConflictBanner(props: {
                 <Text code>
                   {target.address} / {target.protocol.toUpperCase()}
                 </Text>{" "}
-                {stateLabel(target)}
+                {target.status === "unknown" ? t("port.unknown") : t("port.occupied")}
                 {holders.length > 0 && (
                   <span>
-                    ：{" "}
+                    {": "}
                     {holders
                       .map((holder) =>
                         holder.name
-                          ? `${holder.name}（PID ${holder.pid}）`
-                          : `PID ${holder.pid}（无法读取进程信息）`,
+                          ? `${holder.name} (PID ${holder.pid})`
+                          : t("port.pidUnknown", { pid: holder.pid }),
                       )
-                      .join("、")}
+                      .join(", ")}
                   </span>
                 )}
               </div>
             );
           })}
           {hints.map((hint) => (
-            <div key={hint}>{hint}</div>
+            <div key={hint}>{t(hint)}</div>
           ))}
           <div>
-            Namesplit 不会修改系统 DNS。请关闭占用 53
-            端口的程序后重新检测；如为保留端口，可在管理员终端执行{" "}
+            {t("port.guidance")}{" "}
             <Text code>netsh int ipv4 show excludedportrange protocol=udp</Text>{" "}
-            查看。
+            {t("port.guidanceEnd")}
           </div>
         </div>
       }
       action={
         <Button size="small" onClick={onRefresh}>
-          重新检测
+          {t("port.retry")}
         </Button>
       }
     />

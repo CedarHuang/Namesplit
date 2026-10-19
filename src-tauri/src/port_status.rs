@@ -118,7 +118,7 @@ pub async fn port_status(
         .filter(|target| target.status == PortState::Unavailable)
         .count();
     rt.log(&format!(
-        "端口检测：{busy} 个回环目标不可用，{unavailable} 个目标地址在本机不存在，归因受限={}",
+        "端口检测：{busy} 个回环目标被占用或无法绑定，{unavailable} 个目标地址在本机不存在，归因受限={}",
         status.attribution_limited
     ));
     Ok(status)

@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "桌面主窗口的默认权限集",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "window-state:default"]
 }

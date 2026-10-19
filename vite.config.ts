@@ -24,4 +24,13 @@ export default defineConfig({
       ignored: ["**/src-tauri/**"],
     },
   },
+  test: {
+    // 构建产物与 E2E 临时目录里的源码副本不应被当作测试收集。
+    exclude: [
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/build/**",
+      "**/src-tauri/**",
+    ],
+  },
 });
